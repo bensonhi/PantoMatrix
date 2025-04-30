@@ -18,7 +18,7 @@ TARGET_DURATION = 180  # 3 minutes in seconds
 MAX_DURATION = 300    # 5 minutes in seconds
 
 # Custom function to replace beat_format_load for BEAT2 dataset
-def simple_beat_format_load(filepath):
+def simple_beat_format_load(filepath, training=True):
     """Simplified dummy data generator with random seeds for each call"""
     # Use filepath to create a unique seed
     seed = hash(filepath) % 10000
@@ -31,8 +31,13 @@ def simple_beat_format_load(filepath):
     base_pattern = rng.random((300, 330)) 
     noise = rng.random((300, 330)) * 0.3
     
-    # Different speakers get different patterns
-    pattern = base_pattern + noise + (speaker_id * 0.1)
+    if training:
+        # Original version - easier to learn
+        pattern = base_pattern + noise + (speaker_id * 0.1)
+    else:
+        # Testing version - much more challenging
+        pattern = base_pattern + noise + (speaker_id * 0.01)  # Smaller offset
+        pattern += np.random.random((300, 330)) * 0.2  # Additional noise
     
     return {
         'poses': pattern,
@@ -102,7 +107,7 @@ class GestureEmbeddingDataset(Dataset):
                             if os.path.exists(npz_path):
                                 # Use simplified loader
                                 try:
-                                    smplx_data = simple_beat_format_load(npz_path)
+                                    smplx_data = simple_beat_format_load(npz_path, training=True)
                                     num_frames = smplx_data['poses'].shape[0]
                                     duration = num_frames / self.motion_fps
                                     
@@ -137,7 +142,7 @@ class GestureEmbeddingDataset(Dataset):
                                 self.speaker_data[speaker_id] = []
                             
                             # Use simplified loader
-                            smplx_data = simple_beat_format_load(npz_path)
+                            smplx_data = simple_beat_format_load(npz_path, training=False)
                             num_frames = smplx_data['poses'].shape[0]
                             duration = num_frames / self.motion_fps
                             
@@ -212,7 +217,7 @@ class GestureEmbeddingDataset(Dataset):
         
         try:
             # Use simplified loader
-            data = simple_beat_format_load(path)
+            data = simple_beat_format_load(path, training=False)
             if 'poses' in data:
                 return data['poses']
         except Exception as e:
