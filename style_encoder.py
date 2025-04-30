@@ -573,6 +573,96 @@ class EmageWithGestureEmbedding(nn.Module):
             }
 
 
+def test_gesture_encoder(model_path, data_root, batch_size=16):
+    """
+    Test a trained gesture encoder on speaker identification task
+    Args:
+        model_path: Path to saved model checkpoint
+        data_root: Root directory of BEAT2 dataset
+        batch_size: Batch size for testing
+    """
+    # Load the model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = GestureEncoder()
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+    model.eval()
+    
+    # Create test dataset
+    test_dataset = GestureEmbeddingDataset(
+        root_dir=data_root,
+        split_csv_path=os.path.join(data_root, 'train_test_split.csv'),
+        min_duration=10,
+        max_duration=20,
+        use_dummy_data=False  # Use your real data for testing
+    )
+    
+    # Create dataloader
+    test_dataloader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size,
+        shuffle=False,  # No need to shuffle for testing
+        num_workers=2
+    )
+    
+    # Track embeddings and speaker IDs
+    all_embeddings = []
+    all_speakers = []
+    
+    # Compute embeddings for all test samples
+    with torch.no_grad():
+        for batch in tqdm(test_dataloader, desc="Computing embeddings"):
+            motion = batch["motion"].to(device)
+            speaker_ids = batch["speaker_id"]
+            
+            embeddings = model(motion)
+            
+            all_embeddings.append(embeddings.cpu())
+            all_speakers.extend(speaker_ids.tolist())
+    
+    # Concatenate all embeddings
+    all_embeddings = torch.cat(all_embeddings, dim=0)
+    
+    # Compute similarity matrix
+    similarity = torch.matmul(all_embeddings, all_embeddings.T).numpy()
+    
+    # Evaluate retrieval performance
+    correct_top1 = 0
+    correct_top5 = 0
+    total = 0
+    
+    for i in range(len(all_speakers)):
+        # Get top-k most similar samples (excluding self)
+        sim_row = similarity[i].copy()
+        sim_row[i] = -float('inf')  # Exclude self
+        top_indices = np.argsort(sim_row)[::-1][:5]  # Top 5
+        
+        # Check if any of the top-k matches have the same speaker
+        if all_speakers[i] == all_speakers[top_indices[0]]:
+            correct_top1 += 1
+        
+        if any(all_speakers[i] == all_speakers[idx] for idx in top_indices):
+            correct_top5 += 1
+        
+        total += 1
+    
+    # Calculate metrics
+    top1_accuracy = correct_top1 / total
+    top5_accuracy = correct_top5 / total
+    
+    print(f"Testing results on {total} samples:")
+    print(f"Top-1 Accuracy: {top1_accuracy:.4f}")
+    print(f"Top-5 Accuracy: {top5_accuracy:.4f}")
+    
+    return {
+        "top1_accuracy": top1_accuracy,
+        "top5_accuracy": top5_accuracy,
+        "embeddings": all_embeddings.numpy(),
+        "speakers": all_speakers
+    }
+
+
 # Example usage
 if __name__ == "__main__":
     # Paths
@@ -588,9 +678,9 @@ if __name__ == "__main__":
         embedding_dim=256
     )
     
-    # Example of how to create the integrated model (for future use)
-    # integrated_model = EmageWithGestureEmbedding(
-    #     gesture_encoder_path="./outputs/gesture_encoder/gesture_encoder_best.pt",
-    #     emage_model=None,  # Would be initialized with actual EMAGE model
-    #     freeze_gesture_encoder=True
-    # )
+    # Test the trained model
+    test_results = test_gesture_encoder(
+        model_path="./outputs/gesture_encoder/gesture_encoder_best.pt",
+        data_root=data_root,
+        batch_size=16
+    )
