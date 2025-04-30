@@ -350,25 +350,22 @@ class ContrastiveLoss(nn.Module):
     
     def forward(self, embeddings, labels):
         """
-        Compute the InfoNCE loss with debugging
+        Compute the InfoNCE loss
+        Args:
+            embeddings: [batch_size, embedding_dim]
+            labels: [batch_size]
+        Returns:
+            loss: Scalar loss value
         """
         batch_size = embeddings.size(0)
         
         # Early check - we need at least 2 samples
         if batch_size < 2:
-            print(f"WARNING: Batch size {batch_size} is too small for contrastive learning")
             # Return small non-zero loss connected to embeddings
             return embeddings.sum() * 0 + 0.1
         
-        # Print shape and norm information for debugging
-        print(f"Embeddings shape: {embeddings.shape}, Norm: {embeddings.norm(dim=1).mean().item()}")
-        print(f"Labels: {labels.tolist()}")
-        
         # Compute similarity matrix
         sim_matrix = torch.matmul(embeddings, embeddings.T) / self.temperature
-        
-        # Print similarity matrix statistics
-        print(f"Similarity matrix min: {sim_matrix.min().item()}, max: {sim_matrix.max().item()}, mean: {sim_matrix.mean().item()}")
         
         # Create mask for positive pairs (same speaker)
         labels = labels.contiguous().view(-1, 1)
@@ -376,12 +373,10 @@ class ContrastiveLoss(nn.Module):
         
         # Count positive pairs (excluding self-pairs)
         positive_pairs = mask.sum() - batch_size
-        print(f"Number of positive pairs (excluding self): {positive_pairs.item()}")
         
         if positive_pairs == 0:
-            print("ERROR: No positive pairs found in batch!")
-            # Use a small fixed loss to keep training going
-            return embeddings.sum() * 0 + 0.5
+            # Use a small fixed loss to keep training going when no positive pairs
+            return embeddings.sum() * 0 + 0.1
         
         # Mask out self-similarity
         logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=mask.device)
@@ -396,12 +391,10 @@ class ContrastiveLoss(nn.Module):
         mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-12)
         loss = -mean_log_prob_pos.mean()
         
-        # Final check
-        if torch.isnan(loss) or torch.isinf(loss) or loss == 0:
-            print(f"WARNING: Problematic loss value: {loss.item()}")
+        # Final check for numerical stability
+        if torch.isnan(loss) or torch.isinf(loss):
             return embeddings.sum() * 0 + 0.1
             
-        print(f"Contrastive loss: {loss.item()}")
         return loss
 
 
@@ -591,7 +584,7 @@ if __name__ == "__main__":
         data_root=data_root,
         output_dir=output_dir,
         num_epochs=50,
-        batch_size=4,  # Increase to at least 4
+        batch_size=8,  # Increase to at least 4
         embedding_dim=256
     )
     
