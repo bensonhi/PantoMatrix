@@ -142,7 +142,7 @@ class GestureEmbeddingDataset(Dataset):
                                 self.speaker_data[speaker_id] = []
                             
                             # Use simplified loader
-                            smplx_data = simple_beat_format_load(npz_path, training=False)
+                            smplx_data = simple_beat_format_load(npz_path, training=True)
                             num_frames = smplx_data['poses'].shape[0]
                             duration = num_frames / self.motion_fps
                             
@@ -217,7 +217,7 @@ class GestureEmbeddingDataset(Dataset):
         
         try:
             # Use simplified loader
-            data = simple_beat_format_load(path, training=False)
+            data = simple_beat_format_load(path, training=True)
             if 'poses' in data:
                 return data['poses']
         except Exception as e:
