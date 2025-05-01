@@ -32,11 +32,11 @@ def simple_beat_format_load(filepath, training=True):
     noise = rng.random((300, 330)) * 0.3
     
     if training:
-        # Original version - easier to learn
+        # Training version - easier to learn
         pattern = base_pattern + noise + (speaker_id * 0.1)
     else:
-        # Testing version - much more challenging
-        pattern = base_pattern + noise + (speaker_id * 0.01)  # Smaller offset
+        # Testing version - more challenging
+        pattern = base_pattern + noise + (speaker_id * 0.01)  # 10x smaller offset
         pattern += np.random.random((300, 330)) * 0.2  # Additional noise
     
     return {
@@ -581,10 +581,6 @@ class EmageWithGestureEmbedding(nn.Module):
 def test_gesture_encoder(model_path, data_root, batch_size=16):
     """
     Test a trained gesture encoder on speaker identification task
-    Args:
-        model_path: Path to saved model checkpoint
-        data_root: Root directory of BEAT2 dataset
-        batch_size: Batch size for testing
     """
     # Load the model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -594,13 +590,88 @@ def test_gesture_encoder(model_path, data_root, batch_size=16):
     model.to(device)
     model.eval()
     
+    # Create a TESTING dataset class that loads test data
+    class TestGestureEmbeddingDataset(GestureEmbeddingDataset):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Reset and reload with test data
+            self.speaker_data = {}
+            
+            # Load the split information
+            if kwargs.get('split_csv_path') and os.path.exists(kwargs.get('split_csv_path')):
+                df = pd.read_csv(kwargs.get('split_csv_path'))
+                
+                # Process each entry in the CSV - but load TEST data
+                for idx, row in df.iterrows():
+                    video_id = row['id']
+                    speaker_id = int(video_id.split('_')[0])
+                    mode = row['type']
+                    
+                    if mode == 'test':  # Only use test data
+                        if speaker_id not in self.speaker_data:
+                            self.speaker_data[speaker_id] = []
+                        
+                        npz_path = os.path.join(kwargs.get('root_dir'), "smplxflame_30", f"{video_id}.npz")
+                        
+                        if os.path.exists(npz_path):
+                            # Use simplified loader with test=True
+                            try:
+                                smplx_data = simple_beat_format_load(npz_path, training=False)
+                                num_frames = smplx_data['poses'].shape[0]
+                                duration = num_frames / self.motion_fps
+                                
+                                self.speaker_data[speaker_id].append({
+                                    "video_id": video_id,
+                                    "motion_path": npz_path,
+                                    "num_frames": num_frames,
+                                    "duration": duration
+                                })
+                            except Exception as e:
+                                print(f"Error processing {video_id}: {e}")
+            
+            # Recreate segments
+            self.segments = []
+            for speaker_id, clips in self.speaker_data.items():
+                if not clips:
+                    continue
+                
+                # Sort clips by duration
+                clips.sort(key=lambda x: x['duration'], reverse=True)
+                
+                total_frames = 0
+                current_segment = []
+                
+                # Try to create segments of min_duration to max_duration
+                for clip in clips:
+                    if total_frames + clip['num_frames'] <= self.max_frames:
+                        current_segment.append(clip)
+                        total_frames += clip['num_frames']
+                        
+                        # If we've reached the minimum duration, create a segment
+                        if total_frames >= self.min_frames:
+                            self.segments.append({
+                                "speaker_id": speaker_id,
+                                "clips": current_segment.copy(),
+                                "total_frames": total_frames
+                            })
+                            current_segment = []
+                            total_frames = 0
+                
+                # Add remaining clips if they meet the minimum duration
+                if total_frames >= self.min_frames:
+                    self.segments.append({
+                        "speaker_id": speaker_id,
+                        "clips": current_segment,
+                        "total_frames": total_frames
+                    })
+    
     # Create test dataset
-    test_dataset = GestureEmbeddingDataset(
+    test_dataset = TestGestureEmbeddingDataset(
         root_dir=data_root,
         split_csv_path=os.path.join(data_root, 'train_test_split.csv'),
         min_duration=10,
         max_duration=20,
-        use_dummy_data=False  # Use your real data for testing
+        use_dummy_data=False
     )
     
     # Create dataloader
