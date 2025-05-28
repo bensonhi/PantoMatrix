@@ -17,59 +17,41 @@ MOTION_FPS = 30      # FPS for motion data
 TARGET_DURATION = 180  # 3 minutes in seconds
 MAX_DURATION = 300    # 5 minutes in seconds
 
-# Custom function to replace beat_format_load for BEAT2 dataset
+# Custom function to load BEAT2 dataset
 def simple_beat_format_load(filepath, training=True):
-    """Simplified dummy data generator with more realistic variations"""
-    # Use filepath to create a unique seed for this specific file
-    seed = hash(filepath) % 10000
-    rng = np.random.RandomState(seed)
-    
-    # Extract speaker_id for creating subtle speaker-specific patterns
-    speaker_id = int(os.path.basename(filepath).split('_')[0])
-    
-    # Create a base pattern for this specific file (not speaker)
-    base_pattern = rng.random((300, 330))
-    
-    # Add general noise
-    noise = rng.random((300, 330)) * 0.5
-    
-    # Create subtle speaker-specific tendencies (much more realistic)
-    # Use sine waves and different frequency patterns per speaker
-    time_steps = np.arange(300)
-    speaker_tendency = np.zeros((300, 330))
-    
-    # Each speaker has different frequency components and amplitudes
-    # This creates subtle but learnable differences
-    freq1 = 0.1 + (speaker_id % 5) * 0.02  # Different base frequencies
-    freq2 = 0.05 + (speaker_id % 3) * 0.01
-    
-    for dim in range(330):
-        # Different dimensions have different speaker-specific patterns
-        phase_offset = (speaker_id * dim) % (2 * np.pi)
-        amplitude = 0.05 + 0.02 * ((speaker_id + dim) % 3)  # Increased amplitude for better learnability
+    """Load actual BEAT2 SMPL-X data from .npz file"""
+    try:
+        data = np.load(filepath)
+        # BEAT2 format typically has these keys
+        if 'poses' in data:
+            poses = data['poses']  # Shape: [T, 165] for SMPL-X poses
+        elif 'body' in data:
+            poses = data['body']
+        else:
+            # Fallback - use first available array-like key
+            poses = data[list(data.keys())[0]]
         
-        speaker_tendency[:, dim] = (
-            amplitude * np.sin(2 * np.pi * freq1 * time_steps + phase_offset) +
-            amplitude * 0.5 * np.cos(2 * np.pi * freq2 * time_steps + phase_offset)
-        )
-    
-    if training:
-        # Training version
-        pattern = base_pattern + noise + speaker_tendency
-    else:
-        # Testing version - use different seed for additional noise to make it more challenging
-        test_rng = np.random.RandomState(seed + 12345)  # Different but deterministic seed
-        additional_noise = test_rng.random((300, 330)) * 0.3
-        pattern = base_pattern + noise + speaker_tendency + additional_noise
-    
-    return {
-        'poses': pattern,
-        'expressions': rng.random((300, 50)),
-        'trans': rng.random((300, 3))
-    }
+        # Ensure we have the right shape (expand if needed)
+        if poses.shape[1] < 330:
+            # Pad to 330 dimensions if needed (SMPL-X full format)
+            padded_poses = np.zeros((poses.shape[0], 330))
+            padded_poses[:, :poses.shape[1]] = poses
+            poses = padded_poses
+        elif poses.shape[1] > 330:
+            # Truncate if too many dimensions
+            poses = poses[:, :330]
+        
+        return {
+            'poses': poses,
+            'expressions': data.get('expressions', np.zeros((poses.shape[0], 50))),
+            'trans': data.get('trans', np.zeros((poses.shape[0], 3)))
+        }
+    except Exception as e:
+        print(f"Error loading real data from {filepath}: {e}")
+        raise e  # Re-raise to fail fast if data can't be loaded
 
 class GestureEmbeddingDataset(Dataset):
-    def __init__(self, root_dir, split_csv_path=None, min_duration=TARGET_DURATION, max_duration=MAX_DURATION, use_dummy_data=False):
+    def __init__(self, root_dir, split_csv_path=None, min_duration=TARGET_DURATION, max_duration=MAX_DURATION):
         """
         Dataset for gesture style embedding contrastive learning
         Args:
@@ -77,13 +59,11 @@ class GestureEmbeddingDataset(Dataset):
             split_csv_path: Path to train_test_split.csv (if None, will scan directory)
             min_duration: Minimum duration in seconds (default: 3 minutes)
             max_duration: Maximum duration in seconds (default: 5 minutes)
-            use_dummy_data: Whether to use generated dummy data (for testing)
         """
         self.root_dir = root_dir
         self.min_duration = min_duration
         self.max_duration = max_duration
         self.motion_fps = MOTION_FPS
-        self.use_dummy_data = use_dummy_data
         
         # Calculate required sequence lengths
         self.min_frames = int(min_duration * self.motion_fps)
@@ -92,92 +72,76 @@ class GestureEmbeddingDataset(Dataset):
         # Create speaker data dictionary
         self.speaker_data = {}
         
-        if use_dummy_data:
-            print("Using dummy data for testing")
-            # Create dummy speakers with random data
-            for speaker_id in range(1, 6):  # 5 dummy speakers
-                self.speaker_data[speaker_id] = []
-                for i in range(10):  # 10 clips per speaker
-                    clip_duration = random.randint(30, 120)  # Random duration between 30s and 2min
-                    num_frames = clip_duration * MOTION_FPS
-                    
-                    self.speaker_data[speaker_id].append({
-                        "video_id": f"{speaker_id}_dummy_{i}",
-                        "motion_path": f"dummy_{speaker_id}_{i}.npz",  # Dummy path
-                        "num_frames": num_frames,
-                        "duration": clip_duration
-                    })
-        else:
-            # Try to load real data
-            # First look for split CSV
-            if split_csv_path and os.path.exists(split_csv_path):
-                try:
-                    df = pd.read_csv(split_csv_path)
-                    print(f"Loaded split CSV with {len(df)} entries")
-                    
-                    # Process each entry in the CSV
-                    for idx, row in tqdm(df.iterrows(), desc="Loading data", total=len(df)):
-                        video_id = row['id']
-                        speaker_id = int(video_id.split('_')[0])
-                        mode = row['type']
-                        
-                        if mode == 'train':  # Only use training data
-                            if speaker_id not in self.speaker_data:
-                                self.speaker_data[speaker_id] = []
-                            
-                            npz_path = os.path.join(root_dir, "smplxflame_30", f"{video_id}.npz")
-                            
-                            if os.path.exists(npz_path):
-                                # Use simplified loader
-                                try:
-                                    smplx_data = simple_beat_format_load(npz_path, training=True)
-                                    num_frames = smplx_data['poses'].shape[0]
-                                    duration = num_frames / self.motion_fps
-                                    
-                                    self.speaker_data[speaker_id].append({
-                                        "video_id": video_id,
-                                        "motion_path": npz_path,
-                                        "num_frames": num_frames,
-                                        "duration": duration
-                                    })
-                                except Exception as e:
-                                    print(f"Error processing {video_id}: {e}")
-                except Exception as e:
-                    print(f"Error loading CSV: {e}")
-                    # Fall back to scanning directory
-            
-            # If no data loaded, scan directory directly
-            if all(len(clips) == 0 for clips in self.speaker_data.values()):
-                print("No data loaded from CSV, scanning directory directly")
-                smplx_dir = os.path.join(root_dir, "smplxflame_30")
-                if os.path.exists(smplx_dir):
-                    npz_files = glob.glob(os.path.join(smplx_dir, "*.npz"))
-                    print(f"Found {len(npz_files)} NPZ files in directory")
-                    
-                    for npz_path in tqdm(npz_files, desc="Scanning files"):
-                        try:
-                            # Extract video_id and speaker_id from filename
-                            filename = os.path.basename(npz_path)
-                            video_id = filename.replace(".npz", "")
-                            speaker_id = int(video_id.split('_')[0])
-                            
-                            if speaker_id not in self.speaker_data:
-                                self.speaker_data[speaker_id] = []
-                            
-                            # Use simplified loader
-                            smplx_data = simple_beat_format_load(npz_path, training=True)
-                            num_frames = smplx_data['poses'].shape[0]
-                            duration = num_frames / self.motion_fps
-                            
-                            self.speaker_data[speaker_id].append({
-                                "video_id": video_id,
-                                "motion_path": npz_path,
-                                "num_frames": num_frames,
-                                "duration": duration
-                            })
-                        except Exception as e:
-                            print(f"Error processing {npz_path}: {e}")
+        # Try to load real data
+        # First look for split CSV
+        if split_csv_path and os.path.exists(split_csv_path):
+            try:
+                df = pd.read_csv(split_csv_path)
+                print(f"Loaded split CSV with {len(df)} entries")
                 
+                # Process each entry in the CSV
+                for idx, row in tqdm(df.iterrows(), desc="Loading data", total=len(df)):
+                    video_id = row['id']
+                    speaker_id = int(video_id.split('_')[0])
+                    mode = row['type']
+                    
+                    if mode == 'train':  # Only use training data
+                        if speaker_id not in self.speaker_data:
+                            self.speaker_data[speaker_id] = []
+                        
+                        npz_path = os.path.join(root_dir, "smplxflame_30", f"{video_id}.npz")
+                        
+                        if os.path.exists(npz_path):
+                            # Use simplified loader - try real data first
+                            try:
+                                smplx_data = simple_beat_format_load(npz_path, training=True)
+                                num_frames = smplx_data['poses'].shape[0]
+                                duration = num_frames / self.motion_fps
+                                
+                                self.speaker_data[speaker_id].append({
+                                    "video_id": video_id,
+                                    "motion_path": npz_path,
+                                    "num_frames": num_frames,
+                                    "duration": duration
+                                })
+                            except Exception as e:
+                                print(f"Error processing {video_id}: {e}")
+            except Exception as e:
+                print(f"Error loading CSV: {e}")
+                # Fall back to scanning directory
+        
+        # If no data loaded, scan directory directly
+        if all(len(clips) == 0 for clips in self.speaker_data.values()):
+            print("No data loaded from CSV, scanning directory directly")
+            smplx_dir = os.path.join(root_dir, "smplxflame_30")
+            if os.path.exists(smplx_dir):
+                npz_files = glob.glob(os.path.join(smplx_dir, "*.npz"))
+                print(f"Found {len(npz_files)} NPZ files in directory")
+                
+                for npz_path in tqdm(npz_files, desc="Scanning files"):
+                    try:
+                        # Extract video_id and speaker_id from filename
+                        filename = os.path.basename(npz_path)
+                        video_id = filename.replace(".npz", "")
+                        speaker_id = int(video_id.split('_')[0])
+                        
+                        if speaker_id not in self.speaker_data:
+                            self.speaker_data[speaker_id] = []
+                        
+                        # Use simplified loader
+                        smplx_data = simple_beat_format_load(npz_path, training=True)
+                        num_frames = smplx_data['poses'].shape[0]
+                        duration = num_frames / self.motion_fps
+                        
+                        self.speaker_data[speaker_id].append({
+                            "video_id": video_id,
+                            "motion_path": npz_path,
+                            "num_frames": num_frames,
+                            "duration": duration
+                        })
+                    except Exception as e:
+                        print(f"Error processing {npz_path}: {e}")
+        
         # Print summary of loaded data
         print("\nData summary:")
         total_clips = 0
@@ -223,23 +187,14 @@ class GestureEmbeddingDataset(Dataset):
                 })
         
         print(f"Created {len(self.segments)} segments from {len(self.speaker_data)} speakers")
-        
-        # If no segments created, use dummy data as fallback
-        if len(self.segments) == 0 and not use_dummy_data:
-            print("No segments created, falling back to dummy data")
-            self.__init__(root_dir, split_csv_path, min_duration, max_duration, use_dummy_data=True)
     
     def __len__(self):
         return len(self.segments)
     
     def load_motion_data(self, path):
         """Load and preprocess motion data"""
-        if self.use_dummy_data:
-            # Generate random data for testing
-            return np.random.random((1000, 330))
-        
         try:
-            # Use simplified loader
+            # Use simplified loader - try real data first
             data = simple_beat_format_load(path, training=True)
             if 'poses' in data:
                 return data['poses']
@@ -271,7 +226,7 @@ class GestureEmbeddingDataset(Dataset):
                 if current_frame >= self.min_frames:
                     break
             except Exception as e:
-                print(f"Error processing clip {clip['video_id'] if not self.use_dummy_data else clip['motion_path']}: {e}")
+                print(f"Error processing clip {clip['video_id']}: {e}")
         
         # Convert to tensor
         motion_tensor = torch.from_numpy(motion_combined).float()
@@ -637,7 +592,7 @@ def test_gesture_encoder(model_path, data_root, batch_size=16):
                         npz_path = os.path.join(kwargs.get('root_dir'), "smplxflame_30", f"{video_id}.npz")
                         
                         if os.path.exists(npz_path):
-                            # Use simplified loader with test=True
+                            # Use simplified loader with test=True - try real data first
                             try:
                                 smplx_data = simple_beat_format_load(npz_path, training=False)
                                 num_frames = smplx_data['poses'].shape[0]
@@ -693,8 +648,7 @@ def test_gesture_encoder(model_path, data_root, batch_size=16):
         root_dir=data_root,
         split_csv_path=os.path.join(data_root, 'train_test_split.csv'),
         min_duration=10,
-        max_duration=20,
-        use_dummy_data=False
+        max_duration=20
     )
     
     # Debug: Print dataset information
@@ -813,6 +767,24 @@ if __name__ == "__main__":
     # Paths
     data_root = "./BEAT2/beat_english_v2.0.0"
     output_dir = "./outputs/gesture_encoder"
+    
+    # Quick test: Try to load one real file first
+    import glob
+    test_files = glob.glob(os.path.join(data_root, "smplxflame_30", "*.npz"))
+    if test_files:
+        print(f"Testing real data loading with file: {test_files[0]}")
+        try:
+            test_data = simple_beat_format_load(test_files[0])
+            print(f"✅ Successfully loaded real data! Shape: {test_data['poses'].shape}")
+            print(f"Data range: [{test_data['poses'].min():.4f}, {test_data['poses'].max():.4f}]")
+        except Exception as e:
+            print(f"❌ Failed to load real data: {e}")
+            print("Please check if your BEAT2 data files are in the correct format")
+            exit(1)
+    else:
+        print(f"❌ No .npz files found in {os.path.join(data_root, 'smplxflame_30')}")
+        print("Please check your data path")
+        exit(1)
     
     # Train the gesture encoder
     model = train_gesture_model(
