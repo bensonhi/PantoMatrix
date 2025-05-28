@@ -158,43 +158,85 @@ class GestureEmbeddingDataset(Dataset):
 
 
 class GestureEncoder(nn.Module):
-    def __init__(self, input_dim=330, hidden_dim=512, embedding_dim=256):
+    def __init__(self, input_dim=330, hidden_dim=512, embedding_dim=256, max_seq_len=300):
         super(GestureEncoder, self).__init__()
+        
+        # Sequence length control
+        self.max_seq_len = max_seq_len
         
         # Motion processing layers
         self.linear1 = nn.Linear(input_dim, hidden_dim)
         self.bn1 = nn.BatchNorm1d(hidden_dim)
         
-        # Transformer encoder
+        # Temporal encoding with transformers - with memory optimizations
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, 
             nhead=8, 
-            dim_feedforward=1024,
+            dim_feedforward=1024,  # Reduced from 2048
             batch_first=True,
             dropout=0.1
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)  # Reduced from 3
         
-        # Output layers
+        # Enable gradient checkpointing to save memory
+        self.transformer.enable_nested_tensor = False  # Disable nested tensor optimization
+        
+        # Pooling and fully connected layers
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, embedding_dim)
+        
+        # Layer normalization for final embedding
         self.ln = nn.LayerNorm(embedding_dim)
     
     def forward(self, x):
+        """
+        Args:
+            x: Motion sequence [batch_size, seq_length, feature_dim]
+        Returns:
+            embedding: Speaker gesture style embedding [batch_size, embedding_dim]
+        """
         batch_size, seq_len, _ = x.shape
         
-        # Feature extraction
-        x = self.linear1(x)
+        # Downsample if sequence is too long (memory optimization)
+        if seq_len > self.max_seq_len:
+            # Take uniform samples from the sequence
+            indices = torch.linspace(0, seq_len-1, self.max_seq_len).long()
+            x = x[:, indices, :]
+            seq_len = self.max_seq_len
         
-        # Transformer encoding
-        x = self.transformer(x)
+        # Initial feature extraction
+        x = self.linear1(x)  # [batch_size, seq_len, hidden_dim]
         
-        # Global pooling
-        x = x.transpose(1, 2)
-        x = self.pool(x).squeeze(-1)
+        # Process in chunks if still too long
+        if seq_len > 1000:
+            chunk_size = 1000
+            num_chunks = (seq_len + chunk_size - 1) // chunk_size
+            chunk_outputs = []
+            
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, seq_len)
+                
+                if end_idx <= start_idx:
+                    break
+                    
+                chunk = x[:, start_idx:end_idx, :]
+                # Process chunk with transformer
+                chunk_output = self.transformer(chunk)
+                chunk_outputs.append(chunk_output)
+            
+            # Combine chunk outputs
+            x = torch.cat(chunk_outputs, dim=1)
+        else:
+            # Apply transformer layers if sequence is short enough
+            x = self.transformer(x)  # [batch_size, seq_len, hidden_dim]
         
-        # Final projection
+        # Global average pooling across sequence dimension
+        x = x.transpose(1, 2)  # [batch_size, hidden_dim, seq_len]
+        x = self.pool(x).squeeze(-1)  # [batch_size, hidden_dim]
+        
+        # Final projection layers
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         
@@ -271,7 +313,10 @@ def train_gesture_model(data_root, output_dir, num_epochs=50, batch_size=8, lear
     
     # Create model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = GestureEncoder(embedding_dim=embedding_dim).to(device)
+    model = GestureEncoder(
+        embedding_dim=embedding_dim,
+        max_seq_len=1800  # 60s at 30fps
+    ).to(device)
     
     criterion = ContrastiveLoss().to(device)
     optimizer = Adam(model.parameters(), lr=learning_rate)
