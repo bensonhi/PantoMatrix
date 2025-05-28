@@ -700,11 +700,20 @@ def test_gesture_encoder(model_path, data_root, batch_size=16):
     # Debug: Print dataset information
     print(f"Test dataset size: {len(test_dataset)}")
     unique_speakers = set()
+    speaker_counts = {}
     for i in range(len(test_dataset)):
         item = test_dataset[i]
-        unique_speakers.add(item['speaker_id'])
+        speaker_id = item['speaker_id']
+        unique_speakers.add(speaker_id)
+        speaker_counts[speaker_id] = speaker_counts.get(speaker_id, 0) + 1
+    
     print(f"Number of unique speakers in test set: {len(unique_speakers)}")
     print(f"Speaker IDs: {sorted(unique_speakers)}")
+    print(f"Test samples per speaker: {dict(sorted(speaker_counts.items()))}")
+    
+    # Calculate per-speaker accuracy later
+    speaker_correct = {spk: 0 for spk in unique_speakers}
+    speaker_total = {spk: 0 for spk in unique_speakers}
     
     # Create dataloader
     test_dataloader = DataLoader(
@@ -757,6 +766,9 @@ def test_gesture_encoder(model_path, data_root, batch_size=16):
     total = 0
     
     for i in range(len(all_speakers)):
+        current_speaker = all_speakers[i]
+        speaker_total[current_speaker] += 1
+        
         # Get top-k most similar samples (excluding self)
         sim_row = similarity[i].copy()
         sim_row[i] = -float('inf')  # Exclude self
@@ -765,6 +777,7 @@ def test_gesture_encoder(model_path, data_root, batch_size=16):
         # Check if any of the top-k matches have the same speaker
         if all_speakers[i] == all_speakers[top_indices[0]]:
             correct_top1 += 1
+            speaker_correct[current_speaker] += 1
         
         if any(all_speakers[i] == all_speakers[idx] for idx in top_indices):
             correct_top5 += 1
@@ -779,11 +792,19 @@ def test_gesture_encoder(model_path, data_root, batch_size=16):
     print(f"Top-1 Accuracy: {top1_accuracy:.4f}")
     print(f"Top-5 Accuracy: {top5_accuracy:.4f}")
     
+    # Print per-speaker accuracy
+    print(f"\nPer-speaker Top-1 accuracy:")
+    for speaker_id in sorted(unique_speakers):
+        if speaker_total[speaker_id] > 0:
+            spk_accuracy = speaker_correct[speaker_id] / speaker_total[speaker_id]
+            print(f"Speaker {speaker_id}: {spk_accuracy:.3f} ({speaker_correct[speaker_id]}/{speaker_total[speaker_id]})")
+    
     return {
         "top1_accuracy": top1_accuracy,
         "top5_accuracy": top5_accuracy,
         "embeddings": all_embeddings.numpy(),
-        "speakers": all_speakers
+        "speakers": all_speakers,
+        "per_speaker_accuracy": {spk: speaker_correct[spk]/speaker_total[spk] for spk in unique_speakers if speaker_total[spk] > 0}
     }
 
 
@@ -797,7 +818,7 @@ if __name__ == "__main__":
     model = train_gesture_model(
         data_root=data_root,
         output_dir=output_dir,
-        num_epochs=100,  # Increased from 50
+        num_epochs=200,  # Increased from 100
         batch_size=16,   # Increased from 8
         embedding_dim=256
     )
