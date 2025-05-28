@@ -46,7 +46,7 @@ def simple_beat_format_load(filepath, training=True):
     for dim in range(330):
         # Different dimensions have different speaker-specific patterns
         phase_offset = (speaker_id * dim) % (2 * np.pi)
-        amplitude = 0.02 + 0.01 * ((speaker_id + dim) % 3)  # Very small amplitude
+        amplitude = 0.05 + 0.02 * ((speaker_id + dim) % 3)  # Increased amplitude for better learnability
         
         speaker_tendency[:, dim] = (
             amplitude * np.sin(2 * np.pi * freq1 * time_steps + phase_offset) +
@@ -372,7 +372,7 @@ class GestureEncoder(nn.Module):
 
 
 class ContrastiveLoss(nn.Module):
-    def __init__(self, temperature=0.07):
+    def __init__(self, temperature=0.05):  # Reduced from 0.07 for more aggressive learning
         super(ContrastiveLoss, self).__init__()
         self.temperature = temperature
     
@@ -797,8 +797,8 @@ if __name__ == "__main__":
     model = train_gesture_model(
         data_root=data_root,
         output_dir=output_dir,
-        num_epochs=50,
-        batch_size=8,  # Increase to at least 4
+        num_epochs=100,  # Increased from 50
+        batch_size=16,   # Increased from 8
         embedding_dim=256
     )
     
