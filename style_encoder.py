@@ -14,8 +14,8 @@ import glob
 
 # Constants
 MOTION_FPS = 30      # FPS for motion data
-TARGET_DURATION = 180  # 3 minutes in seconds
-MAX_DURATION = 300    # 5 minutes in seconds
+TARGET_DURATION = 5   # 5 seconds - minimum for a valid segment
+MAX_DURATION = 150    # 60 seconds maximum (increased to handle longer clips)
 
 # Custom function to load BEAT2 dataset
 def simple_beat_format_load(filepath, training=True):
@@ -31,16 +31,7 @@ def simple_beat_format_load(filepath, training=True):
             # Fallback - use first available array-like key
             poses = data[list(data.keys())[0]]
         
-        # Ensure we have the right shape (expand if needed)
-        if poses.shape[1] < 330:
-            # Pad to 330 dimensions if needed (SMPL-X full format)
-            padded_poses = np.zeros((poses.shape[0], 330))
-            padded_poses[:, :poses.shape[1]] = poses
-            poses = padded_poses
-        elif poses.shape[1] > 330:
-            # Truncate if too many dimensions
-            poses = poses[:, :330]
-        
+        # Return data as-is without forcing dimensions
         return {
             'poses': poses,
             'expressions': data.get('expressions', np.zeros((poses.shape[0], 50))),
@@ -64,6 +55,7 @@ class GestureEmbeddingDataset(Dataset):
         self.min_duration = min_duration
         self.max_duration = max_duration
         self.motion_fps = MOTION_FPS
+        self.pose_dim = None  # Will be detected from data
         
         # Calculate required sequence lengths
         self.min_frames = int(min_duration * self.motion_fps)
@@ -97,6 +89,11 @@ class GestureEmbeddingDataset(Dataset):
                                 smplx_data = simple_beat_format_load(npz_path, training=True)
                                 num_frames = smplx_data['poses'].shape[0]
                                 duration = num_frames / self.motion_fps
+                                
+                                # Detect pose dimensions from first successful load
+                                if self.pose_dim is None:
+                                    self.pose_dim = smplx_data['poses'].shape[1]
+                                    print(f"Detected pose dimensions: {self.pose_dim}")
                                 
                                 self.speaker_data[speaker_id].append({
                                     "video_id": video_id,
@@ -133,6 +130,11 @@ class GestureEmbeddingDataset(Dataset):
                         num_frames = smplx_data['poses'].shape[0]
                         duration = num_frames / self.motion_fps
                         
+                        # Detect pose dimensions from first successful load
+                        if self.pose_dim is None:
+                            self.pose_dim = smplx_data['poses'].shape[1]
+                            print(f"Detected pose dimensions: {self.pose_dim}")
+                        
                         self.speaker_data[speaker_id].append({
                             "video_id": video_id,
                             "motion_path": npz_path,
@@ -150,43 +152,84 @@ class GestureEmbeddingDataset(Dataset):
             total_clips += len(clips)
         print(f"Total clips loaded: {total_clips}")
         
+        # Debug: Print some clip durations to understand the data
+        print(f"\nDuration requirements: min={self.min_duration}s ({self.min_frames} frames), max={self.max_duration}s ({self.max_frames} frames)")
+        
+        for speaker_id, clips in list(self.speaker_data.items())[:3]:  # Show first 3 speakers
+            if clips:
+                durations = [clip['duration'] for clip in clips]
+                print(f"Speaker {speaker_id} clip durations: min={min(durations):.1f}s, max={max(durations):.1f}s, avg={sum(durations)/len(durations):.1f}s")
+        
         # Create segments of specified duration for each speaker
         self.segments = []
+        segments_per_speaker = {}
+        
         for speaker_id, clips in self.speaker_data.items():
             if not clips:
                 continue
                 
+            segments_per_speaker[speaker_id] = 0
+            
             # Sort clips by duration
             clips.sort(key=lambda x: x['duration'], reverse=True)
             
-            total_frames = 0
-            current_segment = []
-            
-            # Try to create segments of min_duration to max_duration
+            # First, handle individual clips that are long enough
             for clip in clips:
-                if total_frames + clip['num_frames'] <= self.max_frames:
-                    current_segment.append(clip)
-                    total_frames += clip['num_frames']
-                    
-                    # If we've reached the minimum duration, create a segment
-                    if total_frames >= self.min_frames:
-                        self.segments.append({
-                            "speaker_id": speaker_id,
-                            "clips": current_segment.copy(),
-                            "total_frames": total_frames
-                        })
-                        current_segment = []
-                        total_frames = 0
+                if clip['num_frames'] >= self.min_frames:
+                    # If clip is longer than max_duration, we'll truncate it during loading
+                    # But still create a segment from it
+                    self.segments.append({
+                        "speaker_id": speaker_id,
+                        "clips": [clip],
+                        "total_frames": min(clip['num_frames'], self.max_frames)
+                    })
+                    segments_per_speaker[speaker_id] += 1
             
-            # Add remaining clips if they meet the minimum duration
-            if total_frames >= self.min_frames:
-                self.segments.append({
-                    "speaker_id": speaker_id,
-                    "clips": current_segment,
-                    "total_frames": total_frames
-                })
+            # Then try to combine shorter clips if any exist
+            short_clips = [clip for clip in clips if clip['num_frames'] < self.min_frames]
+            if short_clips:
+                total_frames = 0
+                current_segment = []
+                
+                for clip in short_clips:
+                    if total_frames + clip['num_frames'] <= self.max_frames:
+                        current_segment.append(clip)
+                        total_frames += clip['num_frames']
+                        
+                        # If we've reached the minimum duration, create a segment
+                        if total_frames >= self.min_frames:
+                            self.segments.append({
+                                "speaker_id": speaker_id,
+                                "clips": current_segment.copy(),
+                                "total_frames": total_frames
+                            })
+                            segments_per_speaker[speaker_id] += 1
+                            current_segment = []
+                            total_frames = 0
+                
+                # Add remaining clips if they meet the minimum duration
+                if total_frames >= self.min_frames:
+                    self.segments.append({
+                        "speaker_id": speaker_id,
+                        "clips": current_segment,
+                        "total_frames": total_frames
+                    })
+                    segments_per_speaker[speaker_id] += 1
         
         print(f"Created {len(self.segments)} segments from {len(self.speaker_data)} speakers")
+        
+        # Validate that pose dimensions were detected
+        if self.pose_dim is None:
+            raise RuntimeError("No valid data files found. Could not detect pose dimensions. Please check your data path and file formats.")
+        
+        # Debug: Show segments per speaker
+        print("Segments per speaker:")
+        for speaker_id, count in segments_per_speaker.items():
+            if count > 0:
+                print(f"  Speaker {speaker_id}: {count} segments")
+            else:
+                total_duration = sum(clip['duration'] for clip in self.speaker_data[speaker_id])
+                print(f"  Speaker {speaker_id}: 0 segments (total duration: {total_duration:.1f}s, need {self.min_duration}s minimum)")
     
     def __len__(self):
         return len(self.segments)
@@ -200,18 +243,24 @@ class GestureEmbeddingDataset(Dataset):
                 return data['poses']
         except Exception as e:
             print(f"Error loading motion data from {path}: {e}")
-            # Return dummy data as fallback
-            return np.random.random((1000, 330))
+            raise e  # Re-raise to fail fast if data can't be loaded
     
     def __getitem__(self, idx):
+        # Validate that pose dimensions were detected
+        if self.pose_dim is None:
+            raise RuntimeError("Pose dimensions not detected. No valid data files were loaded.")
+            
         segment = self.segments[idx]
         speaker_id = segment["speaker_id"]
         clips = segment["clips"]
         
         # Initialize motion array (max_frames x pose_dims)
-        motion_combined = np.zeros((self.max_frames, 330))
+        motion_combined = np.zeros((self.max_frames, self.pose_dim))
         
         current_frame = 0
+        total_motion_data = []
+        
+        # First pass: collect all motion data to compute mean
         for clip in clips:
             try:
                 motion_data = self.load_motion_data(clip["motion_path"])
@@ -220,13 +269,30 @@ class GestureEmbeddingDataset(Dataset):
                 if num_frames <= 0:
                     break
                     
-                motion_combined[current_frame:current_frame + num_frames] = motion_data[:num_frames]
+                total_motion_data.append(motion_data[:num_frames])
                 current_frame += num_frames
                 
                 if current_frame >= self.min_frames:
                     break
             except Exception as e:
                 print(f"Error processing clip {clip['video_id']}: {e}")
+        
+        # Concatenate all motion data and compute mean for padding
+        if total_motion_data:
+            all_motion = np.concatenate(total_motion_data, axis=0)
+            motion_mean = np.mean(all_motion, axis=0)
+        else:
+            motion_mean = np.zeros(self.pose_dim)
+        
+        # Initialize with mean values instead of zeros
+        motion_combined = np.tile(motion_mean, (self.max_frames, 1))
+        
+        # Second pass: fill in the actual data
+        current_frame = 0
+        for motion_data in total_motion_data:
+            num_frames = motion_data.shape[0]
+            motion_combined[current_frame:current_frame + num_frames] = motion_data
+            current_frame += num_frames
         
         # Convert to tensor
         motion_tensor = torch.from_numpy(motion_combined).float()
@@ -238,7 +304,7 @@ class GestureEmbeddingDataset(Dataset):
 
 
 class GestureEncoder(nn.Module):
-    def __init__(self, input_dim=330, hidden_dim=512, embedding_dim=256, max_seq_len=300):
+    def __init__(self, input_dim, hidden_dim=512, embedding_dim=256, max_seq_len=int(MAX_DURATION * MOTION_FPS)):
         super(GestureEncoder, self).__init__()
         
         # Sequence length control
@@ -398,14 +464,19 @@ def train_gesture_model(data_root, output_dir, num_epochs=50, batch_size=2, lear
     dataset = GestureEmbeddingDataset(
         root_dir=data_root,
         split_csv_path=os.path.join(data_root, 'train_test_split.csv'),
-        min_duration=10,  # 10 seconds
-        max_duration=20   # 20 seconds
+        min_duration=TARGET_DURATION,  # Use global constant
+        max_duration=MAX_DURATION      # Use global constant
     )
     
     # Check if dataset has any data
     if len(dataset) == 0:
         print("Dataset is empty! Cannot train model.")
         return None
+    
+    # Get input dimensions from first sample
+    sample = dataset[0]
+    input_dim = sample["motion"].shape[1]
+    print(f"Detected input dimensions: {input_dim}")
     
     dataloader = DataLoader(
         dataset, 
@@ -417,8 +488,9 @@ def train_gesture_model(data_root, output_dir, num_epochs=50, batch_size=2, lear
     # Create model with memory optimizations
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GestureEncoder(
+        input_dim=input_dim,  # Use detected dimension
         embedding_dim=embedding_dim,
-        max_seq_len=1800  # 60s at 30fps
+        max_seq_len=int(MAX_DURATION * MOTION_FPS)  # Use actual max duration
     ).to(device)
     
     # Enable gradient checkpointing for memory efficiency
@@ -560,14 +632,6 @@ def test_gesture_encoder(model_path, data_root, batch_size=16):
     """
     Test a trained gesture encoder on speaker identification task
     """
-    # Load the model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = GestureEncoder()
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-    
     # Create a TESTING dataset class that loads test data
     class TestGestureEmbeddingDataset(GestureEmbeddingDataset):
         def __init__(self, *args, **kwargs):
@@ -598,6 +662,11 @@ def test_gesture_encoder(model_path, data_root, batch_size=16):
                                 num_frames = smplx_data['poses'].shape[0]
                                 duration = num_frames / self.motion_fps
                                 
+                                # Detect pose dimensions from first successful load
+                                if self.pose_dim is None:
+                                    self.pose_dim = smplx_data['poses'].shape[1]
+                                    print(f"Test data detected pose dimensions: {self.pose_dim}")
+                                
                                 self.speaker_data[speaker_id].append({
                                     "video_id": video_id,
                                     "motion_path": npz_path,
@@ -616,40 +685,67 @@ def test_gesture_encoder(model_path, data_root, batch_size=16):
                 # Sort clips by duration
                 clips.sort(key=lambda x: x['duration'], reverse=True)
                 
-                total_frames = 0
-                current_segment = []
-                
-                # Try to create segments of min_duration to max_duration
+                # First, handle individual clips that are long enough
                 for clip in clips:
-                    if total_frames + clip['num_frames'] <= self.max_frames:
-                        current_segment.append(clip)
-                        total_frames += clip['num_frames']
-                        
-                        # If we've reached the minimum duration, create a segment
-                        if total_frames >= self.min_frames:
-                            self.segments.append({
-                                "speaker_id": speaker_id,
-                                "clips": current_segment.copy(),
-                                "total_frames": total_frames
-                            })
-                            current_segment = []
-                            total_frames = 0
+                    if clip['num_frames'] >= self.min_frames:
+                        self.segments.append({
+                            "speaker_id": speaker_id,
+                            "clips": [clip],
+                            "total_frames": min(clip['num_frames'], self.max_frames)
+                        })
                 
-                # Add remaining clips if they meet the minimum duration
-                if total_frames >= self.min_frames:
-                    self.segments.append({
-                        "speaker_id": speaker_id,
-                        "clips": current_segment,
-                        "total_frames": total_frames
-                    })
-    
+                # Then try to combine shorter clips if any exist
+                short_clips = [clip for clip in clips if clip['num_frames'] < self.min_frames]
+                if short_clips:
+                    total_frames = 0
+                    current_segment = []
+                    
+                    for clip in short_clips:
+                        if total_frames + clip['num_frames'] <= self.max_frames:
+                            current_segment.append(clip)
+                            total_frames += clip['num_frames']
+                            
+                            if total_frames >= self.min_frames:
+                                self.segments.append({
+                                    "speaker_id": speaker_id,
+                                    "clips": current_segment.copy(),
+                                    "total_frames": total_frames
+                                })
+                                current_segment = []
+                                total_frames = 0
+                    
+                    if total_frames >= self.min_frames:
+                        self.segments.append({
+                            "speaker_id": speaker_id,
+                            "clips": current_segment,
+                            "total_frames": total_frames
+                        })
+
     # Create test dataset
     test_dataset = TestGestureEmbeddingDataset(
         root_dir=data_root,
         split_csv_path=os.path.join(data_root, 'train_test_split.csv'),
-        min_duration=10,
-        max_duration=20
+        min_duration=TARGET_DURATION,
+        max_duration=MAX_DURATION
     )
+    
+    # Check if test dataset has any data
+    if len(test_dataset) == 0:
+        print("Test dataset is empty! Cannot test model.")
+        return None
+    
+    # Get input dimensions from first test sample
+    sample = test_dataset[0]
+    input_dim = sample["motion"].shape[1]
+    print(f"Test data input dimensions: {input_dim}")
+    
+    # Load the model with correct input dimensions
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = GestureEncoder(input_dim=input_dim)
+    checkpoint = torch.load(model_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.to(device)
+    model.eval()
     
     # Debug: Print dataset information
     print(f"Test dataset size: {len(test_dataset)}")
@@ -790,7 +886,7 @@ if __name__ == "__main__":
     model = train_gesture_model(
         data_root=data_root,
         output_dir=output_dir,
-        num_epochs=200,  # Increased from 100
+        num_epochs=1,  # Increased from 100
         batch_size=16,   # Increased from 8
         embedding_dim=256
     )
